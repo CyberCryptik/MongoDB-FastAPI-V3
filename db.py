@@ -13,6 +13,7 @@ db = client[DB_NAME]"""
 # db.py
 import os
 from motor.motor_asyncio import AsyncIOMotorClient
+from typing import List
 from dotenv import load_dotenv  # to load env variables
 
 load_dotenv()
@@ -34,3 +35,7 @@ def get_db(name: str | None = None):
 
 async def get_database_names():
     return await client.list_database_names()
+
+async def get_collection_names(db_name: str) -> List[str]:
+    db = client[db_name]
+    return await db.list_collection_names()
