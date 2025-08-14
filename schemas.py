@@ -22,3 +22,6 @@ class AggregateRequest(BaseModel):
     db_name: Optional[str] = None
     collection: str
     pipeline: Union[List[Dict[str, Any]], List[str]]
+
+class SchemaRequest(BaseModel):
+    db_name: Optional[str] = None
