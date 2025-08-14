@@ -10,7 +10,8 @@ from schemas import AggregateRequest
 from db import get_db
 from dotenv import load_dotenv
 from schema_infer import get_schema_map_and_samples
-from db import get_db, get_database_names 
+from db import get_db, get_database_names, get_collection_names 
+from schemas import SchemaRequest 
 
 load_dotenv()
 app = FastAPI()
@@ -133,13 +134,13 @@ async def aggregate_query(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/schema")
+"""@app.get("/schema")
 def read_schema(db_name: Optional[str] = Query(None, description="Database name (optional). If omitted uses DB_NAME from env")) -> Dict[str, Any]:
-    """
+    
     Public endpoint — no API key required.
     Returns both the inferred schema map and one sample doc per collection,
     with all non-JSONable fields pruned out.
-    """
+    
     try:
         data = get_schema_map_and_samples(db_name)
         # samples are already sanitized in schema_infer; just ensure ObjectId strings converted if needed
@@ -149,17 +150,40 @@ def read_schema(db_name: Optional[str] = Query(None, description="Database name 
         }
     except Exception as e:
         logging.exception("Error in /schema")
+        raise HTTPException(status_code=500, detail=str(e))"""
+
+@app.post("/schema")
+def read_schema(payload: SchemaRequest) -> Dict[str, Any]:
+    """
+    Public endpoint - no API key required.
+    Returns the inferred schema map and one sample doc per collection,
+    with all non-JSONable fields pruned out.
+    """
+    try:
+        data = get_schema_map_and_samples(payload.db_name)
+        return {
+            "schema": data["schema"],
+            "samples": data["samples"]
+        }
+    except Exception as e:
+        logging.exception("Error in /schema")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/databases")
-async def list_databases() -> List[str]:
+async def list_databases_with_collections() -> Dict[str, List[str]]:
     """
-    Public endpoint to get a list of available database names.
+    Public endpoint to get a list of database names and their collections.
     """
     try:
         db_names = await get_database_names()
-        # Filter out system databases that aren't useful for an LLM
-        return [name for name in db_names if name not in ["admin", "local", "config"]]
+        
+        result = {}
+        for db_name in db_names:
+            collection_names = await get_collection_names(db_name)
+            result[db_name] = collection_names
+        
+        return result
     except Exception as e:
         logging.exception("Error in /databases")
         raise HTTPException(status_code=500, detail=str(e))
