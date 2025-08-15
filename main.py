@@ -1,34 +1,53 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import APIKeyHeader
 from typing import List, Dict, Any, Union, Optional
-from bson import ObjectId
+from bson import ObjectId, Decimal128 # Explicitly import Decimal128 for serialization
 import json
 import os
 import logging
 
-from schemas import AggregateRequest
-from db import get_db
-from dotenv import load_dotenv
-from schema_infer import get_schema_map_and_samples
-from db import get_db, get_database_names, get_collection_names 
-from schemas import SchemaRequest 
+# Import models and database functions
+from schemas import AggregateRequest, SchemaRequest
+from db import get_db, get_database_names, get_collection_names, get_collection_to_db_map
+from schema_infer import get_schema_map_and_samples # Used by the /schema endpoint
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (should be at the very top)
 load_dotenv()
-app = FastAPI()
+
+# Initialize FastAPI app with custom JSON encoder for Decimal128
+app = FastAPI(
+    json_encoders={
+        Decimal128: lambda v: str(v) # Converts Decimal128 to string for JSON serialization
+    }
+)
+
+# Configure basic logging for visibility
 logging.basicConfig(level=logging.INFO)
 
-# API key setup
+# --- API Key Setup ---
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
-    raise RuntimeError("API_KEY not set in .env")
+    raise RuntimeError("API_KEY not set in .env") # App won't start without API_KEY
 
 api_key_header = APIKeyHeader(name="X-API-Key")
 
 def verify_api_key(api_key: str = Depends(api_key_header)):
+    """
+    Dependency to verify the API key from the 'X-API-Key' header.
+    """
     if api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+# --- Helper Functions for MongoDB Data Handling ---
+
 def convert_objectids(obj: Any) -> Any:
+    """
+    Recursively converts ObjectId instances in results to their string representation.
+    Ensures that MongoDB's ObjectId type is JSON-serializable.
+    """
     if isinstance(obj, list):
         return [convert_objectids(v) for v in obj]
     if isinstance(obj, dict):
@@ -38,24 +57,55 @@ def convert_objectids(obj: Any) -> Any:
     return obj
 
 def normalize_objectid(stage: Any):
+    """
+    Recursively converts string representations of ObjectId back to ObjectId
+    instances within an aggregation pipeline stage. This is crucial for $match
+    operations on '_id' fields.
+    """
     if isinstance(stage, dict):
-        for k, v in list(stage.items()):
+        for k, v in list(stage.items()): # Use list() for safe iteration while modifying dict
             if k == "_id" and isinstance(v, str) and ObjectId.is_valid(v):
                 stage[k] = ObjectId(v)
             else:
-                normalize_objectid(v)
+                normalize_objectid(v) # Recurse into nested dictionaries
     elif isinstance(stage, list):
         for item in stage:
-            normalize_objectid(item)
+            normalize_objectid(item) # Recurse into list items
+
+# --- Global Map for Collection-to-Database Inference ---
+# This map is populated at application startup to allow inferring the database
+# from just the collection name in /aggregate requests.
+collection_to_db_map: Dict[str, str] = {}
+
+# --- Startup Event Handler ---
+@app.on_event("startup")
+async def startup_event():
+    """
+    FastAPI startup event. This function runs once when the application starts.
+    It builds the collection_to_db_map by inspecting available databases and collections.
+    """
+    global collection_to_db_map
+    # Populate the global map using the async function from db.py
+    # Use update to merge the temporary map into the global one.
+    temp_map = await get_collection_to_db_map()
+    collection_to_db_map.update(temp_map)
+    logging.info(f"Collection-to-db map built with {len(collection_to_db_map)} entries.")
+
+# --- API Endpoints ---
 
 @app.post("/aggregate")
 async def aggregate_query(
     payload: AggregateRequest,
-    api_key: str = Depends(verify_api_key)
-):
+    api_key: str = Depends(verify_api_key) # API key is required for this endpoint
+) -> Dict[str, Any]:
+    """
+    Runs a MongoDB aggregation pipeline on the specified database and collection.
+    Automatically infers the database name if not provided, based on the collection name.
+    Includes diagnostic checks to help debug empty results from $match stages.
+    """
     raw_pipeline = payload.pipeline
 
-    # Parse JSON strings if pipeline stages were passed as strings
+    # Handle pipeline stages passed as JSON strings (for flexibility)
     if isinstance(raw_pipeline, list) and raw_pipeline and isinstance(raw_pipeline[0], str):
         try:
             pipeline = [json.loads(stage) for stage in raw_pipeline]
@@ -64,30 +114,56 @@ async def aggregate_query(
     else:
         pipeline = raw_pipeline
 
+    # Ensure the pipeline is a list (as expected by MongoDB aggregation)
     if not isinstance(pipeline, list):
         raise HTTPException(status_code=400, detail="Pipeline must be a list")
 
-    # Normalize any ObjectId strings in the pipeline
+    # Normalize ObjectId strings within the pipeline for correct query execution
     for stage in pipeline:
         normalize_objectid(stage)
 
-    # choose target db (support federated instance or any database)
-    target_db_name = payload.db_name or os.getenv("DB_NAME")
+    # --- Determine Target Database Name ---
+    # Attempt to use the db_name provided in the payload first
+    target_db_name = payload.db_name
+    collection_name = payload.collection
+
+    # If db_name is not provided, try to infer it from the collection_to_db_map
     if not target_db_name:
-        raise HTTPException(status_code=400, detail="No db_name provided and DB_NAME not set")
+        if collection_name in collection_to_db_map:
+            target_db_name = collection_to_db_map[collection_name]
+        else:
+            # If inference fails, and DB_NAME environment variable is not set,
+            # or if the collection isn't in the map, raise an error.
+            if os.getenv("DB_NAME"):
+                # Fallback to default DB_NAME from env if inference fails
+                # and a default is available, though this might not be the intent.
+                # Consider if you truly want this fallback or prefer strict inference.
+                target_db_name = os.getenv("DB_NAME")
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Database for collection '{collection_name}' could not be inferred. Please provide 'db_name' explicitly or ensure a default 'DB_NAME' is set in your environment."
+                )
+    
+    # Final check: if after all logic, target_db_name is still None (unlikely with above changes but for safety)
+    if not target_db_name:
+        raise HTTPException(status_code=500, detail="Failed to determine target database name.")
+
 
     try:
+        # Get the MongoDB database instance
         target_db = get_db(target_db_name)
-        collection = target_db[payload.collection]
+        # Access the specified collection
+        collection = target_db[collection_name]
 
-        # --- DIAGNOSTIC CHECK 1: total docs in collection
+        # --- DIAGNOSTIC CHECK 1: Total documents in collection ---
+        total_docs = None
         try:
             total_docs = await collection.count_documents({})
         except Exception as e:
             logging.warning("count_documents failed (maybe unsupported by federation): %s", e)
-            total_docs = None
 
-        # --- DIAGNOSTIC CHECK 2: if there's a $match stage, test that match with count_documents()
+        # --- DIAGNOSTIC CHECK 2: If a $match stage exists, test its effectiveness ---
         match_stage = None
         for stage in pipeline:
             if isinstance(stage, dict) and "$match" in stage:
@@ -95,11 +171,10 @@ async def aggregate_query(
                 break
 
         if match_stage is not None:
-            # run a simple find/count using the same match to see if any docs exist
+            match_count = None
             try:
                 match_count = await collection.count_documents(match_stage)
             except Exception as e:
-                # if count_documents is unsupported on this federated source, attempt a lightweight find_one
                 logging.warning("count_documents on $match failed: %s — falling back to find_one()", e)
                 try:
                     found = await collection.find_one(match_stage)
@@ -108,56 +183,37 @@ async def aggregate_query(
                     logging.exception("find_one fallback failed: %s", e2)
                     match_count = None
 
-            # If match_count is zero, return a helpful diagnostic instead of an opaque empty aggregation
+            # If the match filter returned no documents, provide a helpful debug message
             if match_count == 0:
-                # return a clear diagnostic so the caller (or LLM) can debug/repair the filter
-                debug = {
-                    "collection": payload.collection,
+                debug_info = {
+                    "collection": collection_name,
                     "db_name": target_db_name,
                     "total_docs": total_docs,
                     "match_docs": 0,
                     "match_filter": match_stage,
                     "message": "No documents matched the pipeline's $match — check the field path, type, or value."
                 }
-                logging.info("Aggregate diagnostic: %s", debug)
-                return {"results": [], "debug": debug}
+                logging.info("Aggregate diagnostic: %s", debug_info)
+                return {"results": [], "debug": debug_info}
 
-        # All checks passed (or none applicable) -> execute aggregation
+        # --- Execute Aggregation Pipeline ---
         cursor = collection.aggregate(pipeline)
-        results = await cursor.to_list(length=1000)
-        # Convert ObjectId in results to JSON-friendly strings
+        results = await cursor.to_list(length=None) # Retrieve all results
+
+        # Convert ObjectIds in the results to strings for JSON serialization
         results = convert_objectids(results)
         return {"results": results}
 
     except Exception as e:
+        # Catch and log any exceptions during the aggregation process
         logging.exception("Error in /aggregate")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-"""@app.get("/schema")
-def read_schema(db_name: Optional[str] = Query(None, description="Database name (optional). If omitted uses DB_NAME from env")) -> Dict[str, Any]:
-    
-    Public endpoint — no API key required.
-    Returns both the inferred schema map and one sample doc per collection,
-    with all non-JSONable fields pruned out.
-    
-    try:
-        data = get_schema_map_and_samples(db_name)
-        # samples are already sanitized in schema_infer; just ensure ObjectId strings converted if needed
-        return {
-            "schema": data["schema"],
-            "samples": data["samples"]
-        }
-    except Exception as e:
-        logging.exception("Error in /schema")
-        raise HTTPException(status_code=500, detail=str(e))"""
 
 @app.post("/schema")
 def read_schema(payload: SchemaRequest) -> Dict[str, Any]:
     """
-    Public endpoint - no API key required.
-    Returns the inferred schema map and one sample doc per collection,
-    with all non-JSONable fields pruned out.
+    Public endpoint to get the inferred schema and sample documents for a database.
+    Database name is provided in the request body.
     """
     try:
         data = get_schema_map_and_samples(payload.db_name)
@@ -169,21 +225,20 @@ def read_schema(payload: SchemaRequest) -> Dict[str, Any]:
         logging.exception("Error in /schema")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/databases")
 async def list_databases_with_collections() -> Dict[str, List[str]]:
     """
-    Public endpoint to get a list of database names and their collections.
+    Public endpoint to list all available database names and their collections.
+    Provides an overview of the data structure for external tools/LLMs.
     """
     try:
         db_names = await get_database_names()
-        
         result = {}
         for db_name in db_names:
             collection_names = await get_collection_names(db_name)
             result[db_name] = collection_names
-        
         return result
     except Exception as e:
         logging.exception("Error in /databases")
         raise HTTPException(status_code=500, detail=str(e))
+
