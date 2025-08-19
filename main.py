@@ -56,25 +56,38 @@ def convert_objectids(obj: Any) -> Any:
         return str(obj)
     return obj
 
-def normalize_objectid(stage: Any):
+def normalize_objectid(data: Any):
     """
-    Recursively converts string representations of ObjectId back to ObjectId
-    instances within an aggregation pipeline stage. This is crucial for $match
-    operations on '_id' fields.
+    Recursively converts string representations of ObjectId to ObjectId instances.
+    Specifically handles _id fields and elements within $in arrays.
+    Modifies the input data in place.
     """
-    if isinstance(stage, dict):
-        for k, v in list(stage.items()): # Use list() for safe iteration while modifying dict
-            if k == "_id" and isinstance(v, str) and ObjectId.is_valid(v):
-                stage[k] = ObjectId(v)
-            else:
-                normalize_objectid(v) # Recurse into nested dictionaries
-    elif isinstance(stage, list):
-        for item in stage:
-            normalize_objectid(item) # Recurse into list items
-
-# --- Global Map for Collection-to-Database Inference ---
-# This map is populated at application startup to allow inferring the database
-# from just the collection name in /aggregate requests.
+    if isinstance(data, dict):
+        for k, v in list(data.items()): # Use list() to allow modification during iteration
+            if k == "_id":
+                if isinstance(v, str) and ObjectId.is_valid(v):
+                    data[k] = ObjectId(v)
+                elif isinstance(v, dict) and "$in" in v and isinstance(v["$in"], list):
+                    # Handle {"_id": {"$in": ["string_oid1", "string_oid2"]}}
+                    converted_in_values = []
+                    for item in v["$in"]:
+                        if isinstance(item, str) and ObjectId.is_valid(item):
+                            converted_in_values.append(ObjectId(item))
+                        else:
+                            converted_in_values.append(item) # Keep non-ObjectId strings as is
+                    data[k]["$in"] = converted_in_values
+                else:
+                    # For other types of _id values or nested structures under _id, recurse.
+                    normalize_objectid(v)
+            elif isinstance(v, (dict, list)):
+                # Recurse for other nested dictionaries or lists
+                normalize_objectid(v)
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            # Recurse for items in the list if they are dicts or lists
+            if isinstance(item, (dict, list)):
+                normalize_objectid(item)
+    # Primitive types (like strings that aren't part of an _id directly or $in list) are returned as is.
 collection_to_db_map: Dict[str, str] = {}
 
 # --- Startup Event Handler ---
@@ -241,4 +254,3 @@ async def list_databases_with_collections() -> Dict[str, List[str]]:
     except Exception as e:
         logging.exception("Error in /databases")
         raise HTTPException(status_code=500, detail=str(e))
-
