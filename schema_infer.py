@@ -25,25 +25,48 @@ def extract_paths(doc: Union[Dict, list, Any], current_path: str = "") -> Dict:
     return paths
 
 def _safe_value(v: Any) -> Any:
-    """Converts a value to a JSON-safe representation."""
+    """
+    Converts a value to a JSON-safe representation by handling BSON types.
+    This function is crucial for normalizing the data.
+    """
+    # Check for BSON number wrappers and convert them to standard Python numbers
+    if isinstance(v, dict):
+        if "$numberInt" in v:
+            return int(v["$numberInt"])
+        if "$numberDouble" in v:
+            return float(v["$numberDouble"])
+        if "$numberLong" in v:
+            return int(v["$numberLong"])
+        if "$date" in v:
+            # Handle date objects, which are also often BSON wrappers
+            return datetime.fromtimestamp(v["$date"] / 1000).isoformat()
+        
+        # Recursively process other dictionaries
+        return {kk: _safe_value(vv) for kk, vv in v.items()}
+
+    # Handle standard BSON types
     if isinstance(v, ObjectId):
         return str(v)
     if isinstance(v, (bytes, bytearray, Binary)):
-        # encode binary as base64 ascii string
+        # Encode binary data as a base64 string
         try:
             return base64.b64encode(bytes(v)).decode("ascii")
         except Exception:
             return repr(v)
+    
+    # Handle native Python date objects
     if isinstance(v, (datetime, date)):
         return v.isoformat()
-    if isinstance(v, dict):
-        return {kk: _safe_value(vv) for kk, vv in v.items()}
+    
+    # Recursively process lists
     if isinstance(v, list):
         return [_safe_value(x) for x in v]
-    # keep primitive json types as-is
+    
+    # Keep primitive JSON types as-is
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
-    # fallback: string representation
+    
+    # Fallback to string representation for unknown types
     return repr(v)
 
 @lru_cache()
