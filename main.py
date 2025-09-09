@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import APIKeyHeader
 from typing import List, Dict, Any, Union, Optional
@@ -88,6 +87,31 @@ def normalize_objectid(data: Any):
             if isinstance(item, (dict, list)):
                 normalize_objectid(item)
     # Primitive types (like strings that aren't part of an _id directly or $in list) are returned as is.
+
+def flatten_nested_lists_recursively(data: Any) -> Any:
+    """
+    Recursively traverses a document to flatten any list that contains another list.
+    This ensures all lists are at a single level.
+    """
+    if isinstance(data, dict):
+        return {k: flatten_nested_lists_recursively(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        # Flatten the current list if it contains sublists
+        flattened_list = []
+        has_nested_list = any(isinstance(item, list) for item in data)
+        if has_nested_list:
+            for item in data:
+                if isinstance(item, list):
+                    flattened_list.extend(item)
+                else:
+                    flattened_list.append(item)
+            data = flattened_list
+
+        # Recurse on the flattened list's elements
+        return [flatten_nested_lists_recursively(item) for item in data]
+    else:
+        return data
+
 collection_to_db_map: Dict[str, str] = {}
 
 # --- Startup Event Handler ---
@@ -130,6 +154,10 @@ async def aggregate_query(
     # Ensure the pipeline is a list (as expected by MongoDB aggregation)
     if not isinstance(pipeline, list):
         raise HTTPException(status_code=400, detail="Pipeline must be a list")
+
+    # NEW: Recursively flatten all nested lists within the pipeline stages.
+    # This is a generic solution that doesn't depend on field names.
+    pipeline = flatten_nested_lists_recursively(pipeline)
 
     # Normalize ObjectId strings within the pipeline for correct query execution
     for stage in pipeline:
@@ -254,3 +282,5 @@ async def list_databases_with_collections() -> Dict[str, List[str]]:
     except Exception as e:
         logging.exception("Error in /databases")
         raise HTTPException(status_code=500, detail=str(e))
+
+
