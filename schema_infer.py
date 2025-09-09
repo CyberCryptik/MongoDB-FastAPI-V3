@@ -7,16 +7,36 @@ from bson import ObjectId, Binary
 from datetime import datetime, date
 from typing import Any, Union, Dict
 
+def _get_deepest_list_type(data: Any) -> str:
+    """
+    Recursively determines if a list is a nested list.
+    Returns 'list' if it's a simple array, and 'list_of_lists' if it's nested.
+    """
+    if not isinstance(data, list):
+        return "list"
+    
+    for item in data:
+        if isinstance(item, list):
+            return "list_of_lists"
+    
+    return "list"
+
+
 def extract_paths(doc: Union[Dict, list, Any], current_path: str = "") -> Dict:
     """Recursively extracts all field paths and their Python types from a document."""
     paths = defaultdict(set)
     if isinstance(doc, dict):
         for k, v in doc.items():
             new_path = f"{current_path}.{k}" if current_path else k
-            paths[new_path].add(type(v).__name__)
+            if isinstance(v, list):
+                paths[new_path].add(_get_deepest_list_type(v))
+            else:
+                paths[new_path].add(type(v).__name__)
+            
             sub_paths = extract_paths(v, new_path)
             for p, t in sub_paths.items():
                 paths[p].update(t)
+
     elif isinstance(doc, list):
         for i, v in enumerate(doc):
             sub_paths = extract_paths(v, current_path)
@@ -24,31 +44,9 @@ def extract_paths(doc: Union[Dict, list, Any], current_path: str = "") -> Dict:
                 paths[p].update(t)
     return paths
 
-def flatten_nested_lists_recursively(data: Any) -> Any:
-    """
-    Recursively traverses a document to flatten any list that contains another list.
-    This ensures all lists are at a single level.
-    """
-    if isinstance(data, dict):
-        return {k: flatten_nested_lists_recursively(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        flattened_list = []
-        has_nested_list = any(isinstance(item, list) for item in data)
-        if has_nested_list:
-            for item in data:
-                if isinstance(item, list):
-                    flattened_list.extend(item)
-                else:
-                    flattened_list.append(item)
-            data = flattened_list
-        return [flatten_nested_lists_recursively(item) for item in data]
-    else:
-        return data
-
 def _safe_value(v: Any) -> Any:
     """
     Converts a value to a JSON-safe representation by handling BSON types.
-    This function is crucial for normalizing the data.
     """
     if isinstance(v, dict):
         if "$numberInt" in v:
@@ -101,8 +99,7 @@ def get_schema_map_and_samples(db_name: str | None = None, sample_size: int = 50
         docs = list(cursor)
         
         for doc in docs:
-            normalized_doc = flatten_nested_lists_recursively(doc)
-            for path, types in extract_paths(normalized_doc).items():
+            for path, types in extract_paths(doc).items():
                 combined[path].update(types)
 
         current_coll_schema = {}
@@ -121,7 +118,7 @@ def get_schema_map_and_samples(db_name: str | None = None, sample_size: int = 50
         schema_map[coll] = current_coll_schema
         
         sample = docs[0] if docs else None
-        samples[coll] = _safe_value(flatten_nested_lists_recursively(sample)) if sample is not None else None
+        samples[coll] = _safe_value(sample) if sample is not None else None
 
     return {
         "schema": schema_map,
