@@ -283,4 +283,3 @@ async def list_databases_with_collections() -> Dict[str, List[str]]:
         logging.exception("Error in /databases")
         raise HTTPException(status_code=500, detail=str(e))
 
-
